@@ -1,0 +1,54 @@
+generator client {
+  provider = "prisma-client-js"
+  // remove custom output so you can keep: import { PrismaClient } from '@prisma/client'
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DB_URL")
+}
+
+model Plc {
+  id        Int      @id @default(autoincrement())
+  name      String
+  ip        String
+  port      Int      @default(102)
+  rack      Int      @default(0)
+  slot      Int      @default(1)
+  type      String
+  enabled   Boolean  @default(true)
+
+  // ---- Diagnostics ----
+  status      String   @default("unknown") // connected|disconnected|unknown
+  lastError   String?
+  lastErrorAt DateTime?
+  errorCount  Int      @default(0)
+
+  tags      Tag[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Tag {
+  id        Int      @id @default(autoincrement())
+  plcId     Int
+  name      String
+
+  // Siemens addressing (you can refactor later)
+  area      String   // DB, PE, PA, MK, TM, CT
+  dbNumber  Int?
+  start     Int
+  amount    Int
+  dataType  String   // BOOL | INT | DINT | REAL | ...
+
+  polling   Boolean  @default(true)
+  readOnly  Boolean  @default(false)
+
+  // ---- Diagnostics ----
+  quality   String?
+  lastError String?
+
+  lastValue String?
+  updatedAt DateTime @updatedAt
+  plc       Plc      @relation(fields: [plcId], references: [id])
+}
