@@ -38,11 +38,24 @@ model Tag {
   area      String   // DB, PE, PA, MK, TM, CT
   dbNumber  Int?
   start     Int
+   bitOffset Int?
   amount    Int
   dataType  String   // BOOL | INT | DINT | REAL | ...
 
+   sortOrder Int      @default(0)
+
   polling   Boolean  @default(true)
   readOnly  Boolean  @default(false)
+
+   // ---- SCALING FIELDS (NEW) ----
+  rawMin    Float?  @default(0)  // e.g., 0.0
+  rawMax    Float?  @default(100) // e.g., 27648.0
+  engMin    Float?  @default(0) // e.g., 0.0
+  engMax    Float?  @default(100) // e.g., 100.0
+
+  // Optional: store scaling formula or unit for UI/display
+  unit      String?  // e.g., "°C", "bar", "m/s"
+  formula   String?  // e.g., "linear", if you later support non-linear
 
   // ---- Diagnostics ----
   quality   String?

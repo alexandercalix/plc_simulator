@@ -105,24 +105,71 @@ export class PollerService implements OnModuleInit {
 
 
     private async reconcilePlcs() {
+        // 1) Load current enabled PLCs from DB
         const rows = await this.prisma.plc.findMany({ where: { enabled: true } });
         const ids = new Set(rows.map(r => r.id));
 
+        // 2) Add NEW PLCs (not yet tracked)
         for (const p of rows) {
             if (!this.clients.has(p.id)) {
                 this.clients.set(p.id, {
                     client: this.s7.createClient(),
-                    plcId: p.id, ip: p.ip, rack: p.rack, slot: p.slot,
-                    connected: false, failures: 0,
+                    plcId: p.id,
+                    ip: p.ip,
+                    rack: p.rack,
+                    slot: p.slot,
+                    connected: false,
+                    failures: 0,
+                    nextRetryAt: 0,
                 });
-                this.log.log(`Registered PLC ${p.id} (${p.name})`);
+                this.log.log(`Registered PLC ${p.id} (${p.name}) @ ${p.ip} r${p.rack}s${p.slot}`);
             }
         }
+
+        // 3) Update EXISTING PLCs if params changed → force reconnect
+        for (const p of rows) {
+            const rt = this.clients.get(p.id);
+            if (!rt) continue;
+
+            const changed =
+                rt.ip !== p.ip ||
+                rt.rack !== p.rack ||
+                rt.slot !== p.slot;
+
+            if (changed) {
+                this.log.log(
+                    `PLC ${p.id} params changed → reconnect `
+                    + `(ip ${rt.ip}→${p.ip}, r${rt.rack}→${p.rack}, s${rt.slot}→${p.slot})`
+                );
+
+                // apply new params
+                rt.ip = p.ip;
+                rt.rack = p.rack;
+                rt.slot = p.slot;
+
+                // force a clean reconnect on next tick
+                rt.connected = false;
+                rt.failures = 0;
+                rt.nextRetryAt = 0;
+                this.recreateClient(rt);
+
+                // (optional) reflect status in DB immediately
+                await this.prisma.plc.update({
+                    where: { id: p.id },
+                    data: { status: 'disconnected', lastError: 'reconfig: awaiting reconnect', lastErrorAt: new Date() },
+                });
+
+                // (optional) notify clients
+                this.events.emitPlcStatus({ plcId: p.id, status: 'disconnected', error: 'reconfig', ts: Date.now() });
+            }
+        }
+
+        // 4) Remove DISABLED/DELETED PLCs
         for (const [id, rt] of this.clients) {
             if (!ids.has(id)) {
                 try { this.s7.disconnect(rt.client); } catch { }
                 this.clients.delete(id);
-                this.log.log(`Unregistered PLC ${id}`);
+                this.log.log(`Unregistered PLC ${id} (disabled/deleted)`);
             }
         }
     }
@@ -149,12 +196,20 @@ export class PollerService implements OnModuleInit {
                     //   this.log.debug(`Reading P${plc.id}/${plc.name} T${t.id}/${t.name} @ DB${t.dbNumber}:${t.start} ${t.dataType}`);
 
                     const [val] = await this.s7.readMany(rt.client, [{
-                        // if you already added asS7Area/asS7Type, prefer those instead of "as any"
                         area: t.area as any,
                         dbNumber: t.dbNumber ?? undefined,
                         start: t.start,
+                         bitOffset: t.bitOffset ?? undefined,
                         amount: t.amount,
                         dataType: t.dataType as any,
+
+                       
+                        rawMin: t.rawMin ?? undefined,
+                        rawMax: t.rawMax ?? undefined,
+                        engMin: t.engMin ?? undefined,
+                        engMax: t.engMax ?? undefined,
+                        unit: t.unit ?? undefined,
+                        formula: t.formula ?? undefined,
                     }]);
 
                     const str = JSON.stringify(val);
@@ -212,132 +267,150 @@ export class PollerService implements OnModuleInit {
 
     // Reuse the existing reconcile + read logic, just callable on demand.
 
-public async reloadNow() {
-  await this.reconcilePlcs();
-}
-
-public async readPlcNow(plcId: number) {
-  const plc = await this.prisma.plc.findUnique({ where: { id: plcId } });
-  if (!plc || !plc.enabled) return;
-
-  const rt = this.clients.get(plc.id);
-  if (!rt) {
-    // register new runtime client right away
-    this.clients.set(plc.id, {
-      client: this.s7.createClient(),
-      plcId: plc.id,
-      ip: plc.ip,
-      rack: plc.rack,
-      slot: plc.slot,
-      connected: false,
-      failures: 0,
-    });
-  }
-  const client = this.clients.get(plc.id)!;
-
-  // connect (with backoff logic already in ensureConnected)
-  const ok = await this.ensureConnected(client);
-  if (!ok) return;
-
-  // read all polling tags now (same as inside tick, but scoped to this PLC)
-  const tags = await this.prisma.tag.findMany({ where: { plcId: plc.id, polling: true } });
-  for (const t of tags) {
-    try {
-      const [val] = await this.s7.readMany(client.client, [{
-        area: t.area as any,
-        dbNumber: t.dbNumber ?? undefined,
-        start: t.start,
-        amount: t.amount,
-        dataType: t.dataType as any,
-      }]);
-
-      const str = JSON.stringify(val);
-      const changed = t.lastValue !== str;
-
-      await this.prisma.tag.update({
-        where: { id: t.id },
-        data: { lastValue: str, quality: 'GOOD', lastError: null },
-      });
-
-      if (changed) {
-        this.events.emitTagUpdate({
-          tagId: t.id, plcId: plc.id, name: t.name, value: val, ts: Date.now(), quality: 'GOOD',
-        });
-      }
-    } catch (e) {
-      const msg = (e as Error).message;
-      this.log.warn(`Immediate read error P${plc.id}/${plc.name} T${t.id}/${t.name}: ${msg}`);
-
-      await this.prisma.tag.update({
-        where: { id: t.id },
-        data: { quality: 'BAD', lastError: msg },
-      });
-
-      // drop connection to allow recovery
-      client.connected = false;
-      try { this.s7.disconnect(client.client); } catch {}
-      await this.prisma.plc.update({
-        where: { id: plc.id },
-        data: { status: 'disconnected', lastError: msg, lastErrorAt: new Date(), errorCount: { increment: 1 } },
-      });
-      this.events.emitPlcStatus({ plcId: plc.id, status: 'disconnected', error: msg, ts: Date.now() });
+    public async reloadNow() {
+        await this.reconcilePlcs();
     }
-  }
-}
 
-public async readTagNow(tagId: number) {
-  const t = await this.prisma.tag.findUnique({ where: { id: tagId }, include: { plc: true } });
-  if (!t || !t.plc || !t.plc.enabled) return;
+    public async readPlcNow(plcId: number) {
+        const plc = await this.prisma.plc.findUnique({ where: { id: plcId } });
+        if (!plc || !plc.enabled) return;
 
-  // ensure runtime client exists
-  if (!this.clients.has(t.plcId)) {
-    this.clients.set(t.plcId, {
-      client: this.s7.createClient(),
-      plcId: t.plcId,
-      ip: t.plc.ip,
-      rack: t.plc.rack,
-      slot: t.plc.slot,
-      connected: false,
-      failures: 0,
-    });
-  }
-  const rt = this.clients.get(t.plcId)!;
+        const rt = this.clients.get(plc.id);
+        if (!rt) {
+            // register new runtime client right away
+            this.clients.set(plc.id, {
+                client: this.s7.createClient(),
+                plcId: plc.id,
+                ip: plc.ip,
+                rack: plc.rack,
+                slot: plc.slot,
+                connected: false,
+                failures: 0,
+            });
+        }
+        const client = this.clients.get(plc.id)!;
 
-  const ok = await this.ensureConnected(rt);
-  if (!ok) return;
+        // connect (with backoff logic already in ensureConnected)
+        const ok = await this.ensureConnected(client);
+        if (!ok) return;
 
-  try {
-    const [val] = await this.s7.readMany(rt.client, [{
-      area: t.area as any,
-      dbNumber: t.dbNumber ?? undefined,
-      start: t.start,
-      amount: t.amount,
-      dataType: t.dataType as any,
-    }]);
+        // read all polling tags now (same as inside tick, but scoped to this PLC)
+        const tags = await this.prisma.tag.findMany({ where: { plcId: plc.id, polling: true } });
+        for (const t of tags) {
+            try {
+                const [val] = await this.s7.readMany(client.client, [{
+                    area: t.area as any,
+                    dbNumber: t.dbNumber ?? undefined,
+                    start: t.start,
+                     bitOffset: t.bitOffset ?? undefined,
+                    amount: t.amount,
+                    dataType: t.dataType as any,
 
-    const str = JSON.stringify(val);
-    const changed = t.lastValue !== str;
+                    // 👇 ADD THESE NEW FIELDS FOR SCALING
+                    rawMin: t.rawMin ?? undefined,
+                    rawMax: t.rawMax ?? undefined,
+                    engMin: t.engMin ?? undefined,
+                    engMax: t.engMax ?? undefined,
+                    unit: t.unit ?? undefined,
+                    formula: t.formula ?? undefined,
+                }]);
 
-    await this.prisma.tag.update({
-      where: { id: t.id },
-      data: { lastValue: str, quality: 'GOOD', lastError: null },
-    });
+                const str = JSON.stringify(val);
+                const changed = t.lastValue !== str;
 
-    if (changed) {
-      this.events.emitTagUpdate({
-        tagId: t.id, plcId: t.plcId, name: t.name, value: val, ts: Date.now(), quality: 'GOOD',
-      });
+                await this.prisma.tag.update({
+                    where: { id: t.id },
+                    data: { lastValue: str, quality: 'GOOD', lastError: null },
+                });
+
+                if (changed) {
+                    this.events.emitTagUpdate({
+                        tagId: t.id, plcId: plc.id, name: t.name, value: val, ts: Date.now(), quality: 'GOOD',
+                    });
+                }
+            } catch (e) {
+                const msg = (e as Error).message;
+                this.log.warn(`Immediate read error P${plc.id}/${plc.name} T${t.id}/${t.name}: ${msg}`);
+
+                await this.prisma.tag.update({
+                    where: { id: t.id },
+                    data: { quality: 'BAD', lastError: msg },
+                });
+
+                // drop connection to allow recovery
+                client.connected = false;
+                try { this.s7.disconnect(client.client); } catch { }
+                await this.prisma.plc.update({
+                    where: { id: plc.id },
+                    data: { status: 'disconnected', lastError: msg, lastErrorAt: new Date(), errorCount: { increment: 1 } },
+                });
+                this.events.emitPlcStatus({ plcId: plc.id, status: 'disconnected', error: msg, ts: Date.now() });
+            }
+        }
     }
-  } catch (e) {
-    const msg = (e as Error).message;
-    this.log.warn(`Immediate read error T${t.id}/${t.name}: ${msg}`);
-    await this.prisma.tag.update({
-      where: { id: t.id },
-      data: { quality: 'BAD', lastError: msg },
-    });
-    rt.connected = false;
-    try { this.s7.disconnect(rt.client); } catch {}
-  }
-}
+
+    public async readTagNow(tagId: number) {
+        const t = await this.prisma.tag.findUnique({ where: { id: tagId }, include: { plc: true } });
+        if (!t || !t.plc || !t.plc.enabled) return;
+
+        // ensure runtime client exists
+        if (!this.clients.has(t.plcId)) {
+            this.clients.set(t.plcId, {
+                client: this.s7.createClient(),
+                plcId: t.plcId,
+                ip: t.plc.ip,
+                rack: t.plc.rack,
+                slot: t.plc.slot,
+                connected: false,
+                failures: 0,
+            });
+        }
+        const rt = this.clients.get(t.plcId)!;
+
+        const ok = await this.ensureConnected(rt);
+        if (!ok) return;
+
+        try {
+            const [val] = await this.s7.readMany(rt.client, [{
+                area: t.area as any,
+                dbNumber: t.dbNumber ?? undefined,
+                start: t.start,
+                 bitOffset: t.bitOffset ?? undefined,
+                amount: t.amount,
+                dataType: t.dataType as any,
+
+                // 👇 ADD THESE NEW FIELDS FOR SCALING
+                rawMin: t.rawMin ?? undefined,
+                rawMax: t.rawMax ?? undefined,
+                engMin: t.engMin ?? undefined,
+                engMax: t.engMax ?? undefined,
+                unit: t.unit ?? undefined,
+                formula: t.formula ?? undefined,
+            }]);
+
+            const str = JSON.stringify(val);
+            const changed = t.lastValue !== str;
+
+            await this.prisma.tag.update({
+                where: { id: t.id },
+                data: { lastValue: str, quality: 'GOOD', lastError: null },
+            });
+
+            if (changed) {
+                this.events.emitTagUpdate({
+                    tagId: t.id, plcId: t.plcId, name: t.name, value: val, ts: Date.now(), quality: 'GOOD',
+                });
+            }
+        } catch (e) {
+            const msg = (e as Error).message;
+            this.log.warn(`Immediate read error T${t.id}/${t.name}: ${msg}`);
+            await this.prisma.tag.update({
+                where: { id: t.id },
+                data: { quality: 'BAD', lastError: msg },
+            });
+            rt.connected = false;
+            try { this.s7.disconnect(rt.client); } catch { }
+        }
+    }
 
 }

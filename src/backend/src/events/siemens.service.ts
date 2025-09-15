@@ -8,8 +8,16 @@ export type ReadSpec = {
   area: S7Area;
   dbNumber?: number;
   start: number;
+  bitOffset?: number;
   amount: number;
   dataType: S7DataType;
+  // ---- SCALING FIELDS  ----
+  rawMin?: number;   // e.g., 0.0
+  rawMax?: number;   // e.g., 27648.0
+  engMin?: number;   // e.g., 0.0
+  engMax?: number;   // e.g., 100.0
+  unit?: string;     // e.g., "°C"
+  formula?: string;  // e.g., "linear"
 };
 
 @Injectable()
@@ -24,20 +32,20 @@ export class SiemensService {
   }
 
   /** Connect to PLC */
- connect(client: any, ip: string, rack: number, slot: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    client.ConnectTo(ip, rack, slot, (err: number) => {
-      if (err) {
-        const txt = client.ErrorText(err);
-        this.log.error(`ConnectTo failed rc=${err} msg=${txt}`);
-        reject(new Error(`S7 connect rc=${err} msg=${txt}`));
-      } else {
-        this.log.log(`ConnectTo OK -> ip=${ip} rack=${rack} slot=${slot}`);
-        resolve();
-      }
+  connect(client: any, ip: string, rack: number, slot: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      client.ConnectTo(ip, rack, slot, (err: number) => {
+        if (err) {
+          const txt = client.ErrorText(err);
+          this.log.error(`ConnectTo failed rc=${err} msg=${txt}`);
+          reject(new Error(`S7 connect rc=${err} msg=${txt}`));
+        } else {
+          this.log.log(`ConnectTo OK -> ip=${ip} rack=${rack} slot=${slot}`);
+          resolve();
+        }
+      });
     });
-  });
-}
+  }
 
   /** Disconnect (safe) */
   disconnect(client: any) {
@@ -49,89 +57,167 @@ export class SiemensService {
    * For performance later, you can group and use ReadMultiVars.
    */// helper to build rich snap7 error messages
 
-// Map our area string to lean helper names
-private areaHelper(area: 'DB'|'PE'|'PA'|'MK'|'TM'|'CT') {
-  switch (area) {
-    case 'DB': return { read: 'DBRead',  write: 'DBWrite'  }; // (db,start,size[,cb])
-    case 'PE': return { read: 'EBRead',  write: 'EBWrite'  }; // (start,size[,cb])
-    case 'PA': return { read: 'ABRead',  write: 'ABWrite'  }; // (start,size[,cb])
-    case 'MK': return { read: 'MBRead',  write: 'MBWrite'  }; // (start,size[,cb])
-    case 'TM': return { read: 'TMRead',  write: 'TMWrite'  }; // (start,size[,cb]) size = amount * 2
-    case 'CT': return { read: 'CTRead',  write: 'CTWrite'  }; // (start,size[,cb]) size = amount * 2
-    default: throw new Error(`Unsupported area ${area}`);
+  // Map our area string to lean helper names
+  private areaHelper(area: 'DB' | 'PE' | 'PA' | 'MK' | 'TM' | 'CT') {
+    switch (area) {
+      case 'DB': return { read: 'DBRead', write: 'DBWrite' }; // (db,start,size[,cb])
+      case 'PE': return { read: 'EBRead', write: 'EBWrite' }; // (start,size[,cb])
+      case 'PA': return { read: 'ABRead', write: 'ABWrite' }; // (start,size[,cb])
+      case 'MK': return { read: 'MBRead', write: 'MBWrite' }; // (start,size[,cb])
+      case 'TM': return { read: 'TMRead', write: 'TMWrite' }; // (start,size[,cb]) size = amount * 2
+      case 'CT': return { read: 'CTRead', write: 'CTWrite' }; // (start,size[,cb]) size = amount * 2
+      default: throw new Error(`Unsupported area ${area}`);
+    }
   }
-}
 
-private snap7Error(client: any, where: string) {
-  const rc = client.LastError?.() ?? -1;
-  const txt = client.ErrorText ? client.ErrorText(rc) : 'unknown';
-  return new Error(`${where} rc=${rc} msg=${txt}`);
-}
+  // In SiemensService.ts
 
-async readMany(client: any, specs: ReadSpec[]): Promise<any[]> {
-  const out: any[] = [];
+  private scaleRawToEngineering(rawValue: number, spec: ReadSpec): number {
+    // Skip scaling for BOOL
+    if (spec.dataType === 'BOOL') {
+      return rawValue;
+    }
 
-  for (const s of specs) {
-    const sizeBytes = this.byteSize(s.dataType) * Math.max(1, s.amount);
-    const h = this.areaHelper(s.area);
+    const { rawMin, rawMax, engMin, engMax } = spec;
 
-    if (s.area === 'DB') {
-      // DBRead(db, startBytes, sizeBytes) -> Buffer | false
-      const res: Buffer | false = client[h.read](s.dbNumber ?? 0, s.start, sizeBytes);
-      if (res === false) throw this.snap7Error(client, `DBRead db=${s.dbNumber} start=${s.start} size=${sizeBytes}`);
-     
-      out.push(this.decode(res, s.dataType, s.amount));
-    } else if (s.area === 'TM' || s.area === 'CT') {
-      // Timers/Counters are 2 bytes each; helpers return Buffer | false
-      const elements = Math.max(1, s.amount);
+    // Only scale if all scaling parameters are meaningfully set (not just defaults)
+    const hasScaling = rawMin != null && rawMax != null && engMin != null && engMax != null &&
+      (rawMin !== 0 || rawMax !== 100 || engMin !== 0 || engMax !== 100);
+
+    if (!hasScaling || typeof rawValue !== 'number') {
+      return rawValue; // no scaling → return as-is
+    }
+
+    // Avoid division by zero
+    if (rawMax === rawMin) {
+      this.log.warn(`Invalid scaling config: rawMin (${rawMin}) equals rawMax (${rawMax})`);
+      return rawValue;
+    }
+
+    // Linear scaling: raw → engineering
+    let scaled = engMin + (rawValue - rawMin) * (engMax - engMin) / (rawMax - rawMin);
+
+    // Clamp to engineering range
+    scaled = Math.max(engMin, Math.min(engMax, scaled));
+
+    // Round if target data type is integer-based
+    if (spec.dataType === 'INT' || spec.dataType === 'DINT' || spec.dataType === 'WORD') {
+      scaled = Math.round(scaled);
+    }
+
+    this.log.debug(`Scaled RAW ${rawValue} → ENG ${scaled} using [${rawMin}:${rawMax}] → [${engMin}:${engMax}]`);
+    return scaled;
+  }
+
+  private snap7Error(client: any, where: string) {
+    const rc = client.LastError?.() ?? -1;
+    const txt = client.ErrorText ? client.ErrorText(rc) : 'unknown';
+    return new Error(`${where} rc=${rc} msg=${txt}`);
+  }
+  async readMany(client: any, specs: ReadSpec[]): Promise<any[]> {
+    const out: any[] = [];
+
+    for (const s of specs) {
+      const sizeBytes = this.byteSize(s.dataType) * Math.max(1, s.amount);
+      const h = this.areaHelper(s.area);
+
+      let res: Buffer | false;
+
+      if (s.area === 'DB') {
+        // DBRead(db, startBytes, sizeBytes) -> Buffer | false
+        res = client[h.read](s.dbNumber ?? 0, s.start, sizeBytes);
+        if (res === false) throw this.snap7Error(client, `DBRead db=${s.dbNumber} start=${s.start} size=${sizeBytes}`);
+      } else if (s.area === 'TM' || s.area === 'CT') {
+        // Timers/Counters are 2 bytes each
+        const elements = Math.max(1, s.amount);
+        const byteLen = 2 * elements;
+        res = client[h.read](s.start, byteLen);
+        if (res === false) throw this.snap7Error(client, `${h.read} start=${s.start} size=${byteLen}`);
+      } else {
+        // PE/PA/MK -> EB/AB/MB
+        res = client[h.read](s.start, sizeBytes);
+        if (res === false) throw this.snap7Error(client, `${h.read} start=${s.start} size=${sizeBytes}`);
+      }
+
+      // Decode raw buffer → JS value(s)
+      const decoded = this.decode(res, s.dataType, s.amount, s.bitOffset);
+
+      // Apply scaling: raw → engineering
+      let scaledValue: any;
+
+      if (Array.isArray(decoded)) {
+        scaledValue = decoded.map(v => typeof v === 'number' ? this.scaleRawToEngineering(v, s) : v);
+      } else {
+        scaledValue = typeof decoded === 'number' ? this.scaleRawToEngineering(decoded, s) : decoded;
+      }
+
+      out.push(scaledValue);
+    }
+
+    return out;
+  }
+
+  async writeOne(client: any, spec: ReadSpec, value: any): Promise<void> {
+    // ---- SCALE engineering value → raw value (if scaling fields are set) ----
+    let writeValue = value;
+
+    const { rawMin, rawMax, engMin, engMax } = spec;
+
+    // Only scale if all scaling parameters are meaningfully set (not just defaults)
+    const hasScaling = rawMin != null && rawMax != null && engMin != null && engMax != null &&
+      (rawMin !== 0 || rawMax !== 100 || engMin !== 0 || engMax !== 100);
+
+    if (hasScaling && typeof value === 'number') {
+      // Avoid division by zero
+      if (engMax === engMin) {
+        throw new Error(`Invalid scaling: engMin (${engMin}) equals engMax (${engMax})`);
+      }
+
+      // Linear scaling: eng → raw
+      let scaled = rawMin + (value - engMin) * (rawMax - rawMin) / (engMax - engMin);
+
+      // Clamp to raw range
+      scaled = Math.max(rawMin, Math.min(rawMax, scaled));
+
+      // Round based on target data type
+      if (spec.dataType === 'INT' || spec.dataType === 'DINT' || spec.dataType === 'WORD') {
+        scaled = Math.round(scaled);
+      }
+      // For REAL, leave as float
+
+      writeValue = scaled;
+
+      this.log.debug(`Scaled engineering value ${value} → raw value ${writeValue} using [${engMin}:${engMax}] → [${rawMin}:${rawMax}]`);
+    }
+
+    // ---- Proceed with original logic, using writeValue instead of value ----
+    const sizeBytes = this.byteSize(spec.dataType) * Math.max(1, spec.amount);
+    const h = this.areaHelper(spec.area);
+    const buf = this.encode(writeValue, spec.dataType, spec.amount, spec.bitOffset); // ← use scaled value here
+
+    if (spec.area === 'DB') {
+      const ok: boolean = client[h.write](spec.dbNumber ?? 0, spec.start, sizeBytes, buf);
+      if (!ok) throw this.snap7Error(client, `DBWrite db=${spec.dbNumber} start=${spec.start} size=${sizeBytes}`);
+      this.log.debug(`DBWrite db=${spec.dbNumber} start=${spec.start} size=${sizeBytes} buf=0x${buf.toString('hex')} value=${writeValue}`);
+    } else if (spec.area === 'TM' || spec.area === 'CT') {
+      const elements = Math.max(1, spec.amount);
       const byteLen = 2 * elements;
-      const res: Buffer | false = client[h.read](s.start, byteLen);
-      if (res === false) throw this.snap7Error(client, `${h.read} start=${s.start} size=${byteLen}`);
-    this.log.debug(`${h.read} start=${s.start} size=${byteLen} buf=0x${res.toString('hex')}`);
-      out.push(this.decode(res, s.dataType, s.amount));
+      if (buf.length !== byteLen) {
+        const tmp = Buffer.alloc(byteLen);
+        buf.copy(tmp, 0, 0, Math.min(buf.length, byteLen));
+        const ok: boolean = client[h.write](spec.start, byteLen, tmp);
+        if (!ok) throw this.snap7Error(client, `${h.write} start=${spec.start} size=${byteLen}`);
+      } else {
+        const ok: boolean = client[h.write](spec.start, byteLen, buf);
+        if (!ok) throw this.snap7Error(client, `${h.write} start=${spec.start} size=${byteLen}`);
+      }
+      this.log.debug(`${h.write} start=${spec.start} size=${byteLen} buf=0x${buf.toString('hex')}`);
     } else {
-      // PE/PA/MK -> EB/AB/MB Read(startBytes, sizeBytes)
-      const res: Buffer | false = client[h.read](s.start, sizeBytes);
-      if (res === false) throw this.snap7Error(client, `${h.read} start=${s.start} size=${sizeBytes}`);
-      this.log.debug(`${h.read} start=${s.start} size=${sizeBytes} buf=0x${res.toString('hex')}`);
-      out.push(this.decode(res, s.dataType, s.amount));
+      const ok: boolean = client[h.write](spec.start, sizeBytes, buf);
+      if (!ok) throw this.snap7Error(client, `${h.write} start=${spec.start} size=${sizeBytes}`);
+      this.log.debug(`${h.write} start=${spec.start} size=${sizeBytes} buf=0x${buf.toString('hex')}`);
     }
   }
-
-  return out;
-}
-
-async writeOne(client: any, spec: ReadSpec, value: any): Promise<void> {
-  const sizeBytes = this.byteSize(spec.dataType) * Math.max(1, spec.amount);
-  const h = this.areaHelper(spec.area);
-  const buf = this.encode(value, spec.dataType, spec.amount);
-
-  if (spec.area === 'DB') {
-    // DBWrite(db, startBytes, sizeBytes, buffer) -> boolean
-    const ok: boolean = client[h.write](spec.dbNumber ?? 0, spec.start, sizeBytes, buf);
-    if (!ok) throw this.snap7Error(client, `DBWrite db=${spec.dbNumber} start=${spec.start} size=${sizeBytes}`);
-    this.log.debug(`DBWrite db=${spec.dbNumber} start=${spec.start} size=${sizeBytes} buf=0x${buf.toString('hex')}`);
-  } else if (spec.area === 'TM' || spec.area === 'CT') {
-    const elements = Math.max(1, spec.amount);
-    const byteLen = 2 * elements;
-    if (buf.length !== byteLen) {
-      // re-encode as WORDs for TM/CT if needed
-      const tmp = Buffer.alloc(byteLen);
-      buf.copy(tmp, 0, 0, Math.min(buf.length, byteLen));
-      const ok: boolean = client[h.write](spec.start, byteLen, tmp);
-      if (!ok) throw this.snap7Error(client, `${h.write} start=${spec.start} size=${byteLen}`);
-    } else {
-      const ok: boolean = client[h.write](spec.start, byteLen, buf);
-      if (!ok) throw this.snap7Error(client, `${h.write} start=${spec.start} size=${byteLen}`);
-    }
-    this.log.debug(`${h.write} start=${spec.start} size=${byteLen} buf=0x${buf.toString('hex')}`);
-  } else {
-    // PE/PA/MK -> EB/AB/MB Write(startBytes, sizeBytes, buffer)
-    const ok: boolean = client[h.write](spec.start, sizeBytes, buf);
-    if (!ok) throw this.snap7Error(client, `${h.write} start=${spec.start} size=${sizeBytes}`);
-    this.log.debug(`${h.write} start=${spec.start} size=${sizeBytes} buf=0x${buf.toString('hex')}`);
-  }
-}
 
   // ---------- helpers ----------
 
@@ -186,11 +272,15 @@ async writeOne(client: any, spec: ReadSpec, value: any): Promise<void> {
   }
 
   /** Decode buffer -> value(s) according to type/amount */
-  private decode(buf: Buffer, type: ReadSpec['dataType'], amount: number): any {
+  private decode(buf: Buffer, type: ReadSpec['dataType'], amount: number, bitOffset?: number): any {
     const size = this.byteSize(type);
     const readOne = (offset: number) => {
       switch (type) {
-        case 'BOOL': return (buf.readUInt8(offset) & 0x01) !== 0; // bit0 only (simple mode)
+        case 'BOOL': {
+          const bit = bitOffset ?? 0; // default to bit 0
+          if (bit < 0 || bit > 7) throw new Error(`Invalid bitOffset ${bit} for BOOL`);
+          return (buf.readUInt8(offset) & (1 << bit)) !== 0;
+        }
         case 'BYTE': return buf.readUInt8(offset);
         case 'WORD': return buf.readUInt16BE(offset);
         case 'INT': return buf.readInt16BE(offset);
@@ -210,14 +300,30 @@ async writeOne(client: any, spec: ReadSpec, value: any): Promise<void> {
   }
 
   /** Encode value(s) -> buffer according to type/amount */
-  private encode(value: any, type: ReadSpec['dataType'], amount: number): Buffer {
+  private encode(value: any, type: ReadSpec['dataType'], amount: number, bitOffset?: number): Buffer {
     const size = this.byteSize(type);
     const total = size * Math.max(1, amount);
     const buf = Buffer.alloc(total);
 
     const writeOne = (val: any, offset: number) => {
       switch (type) {
-        case 'BOOL': buf.writeUInt8(val ? 1 : 0, offset); break; // write bit0
+        case 'BOOL': {
+          const bit = bitOffset ?? 0;
+          if (bit < 0 || bit > 7) throw new Error(`Invalid bitOffset ${bit} for BOOL`);
+
+          // Read current byte (if exists), or start with 0
+          let byte = buf.length > offset ? buf.readUInt8(offset) : 0;
+
+          // Set or clear the bit
+          if (val) {
+            byte |= (1 << bit); // set bit
+          } else {
+            byte &= ~(1 << bit); // clear bit
+          }
+
+          buf.writeUInt8(byte, offset);
+          break;
+        }
         case 'BYTE': buf.writeUInt8(this.toUInt(val), offset); break;
         case 'WORD': buf.writeUInt16BE(this.toUInt(val), offset); break;
         case 'INT': buf.writeInt16BE(this.toInt(val), offset); break;

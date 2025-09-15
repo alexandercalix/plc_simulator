@@ -8,10 +8,26 @@ export class PlcService {
     private readonly prisma: PrismaService,
     @Inject(forwardRef(() => PollerService))
     private readonly poller: PollerService,
-  ) {}
+  ) { }
 
-  findAll() { return this.prisma.plc.findMany({ include: { tags: true } }); }
-  findOne(id: number) { return this.prisma.plc.findUnique({ where: { id }, include: { tags: true } }); }
+  findAll() {
+    return this.prisma.plc.findMany({
+      include: { tags: true }, // 👈 optional, but good for /plcs
+    });
+  }
+
+  findOne(id: number) {
+  return this.prisma.plc.findUnique({
+    where: { id },
+    include: {
+      tags: {
+        orderBy: {
+          sortOrder: 'asc', // 👈 sort by user-defined order
+        },
+      },
+    },
+  });
+}
 
   async create(dto: any) {
     const plc = await this.prisma.plc.create({ data: dto as any });
